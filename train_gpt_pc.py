@@ -689,7 +689,7 @@ class GPT(nn.Module):
         self.pc_enabled = h.pc_enabled
         # Buffer for PC alpha — updated each step from outside the compiled graph.
         # Dynamo guards on tensor shape/dtype/device but NOT values, so no recompilation.
-        self.register_buffer('_pc_alpha_buf', torch.zeros(1))
+        self.register_buffer('_pc_alpha_buf', torch.zeros(()))
         if self.pc_enabled:
             # One PC head per adjacent layer pair (physical layers).
             # When depth recurrence repeats layers, the same PC head is reused
