@@ -1607,12 +1607,12 @@ def train_model(h, device, val_data):
     restore_fp32_params(base_model)
 
     # When PC is enabled, collect_hiddens=True uses dynamic Python lists that
-    # break torch.compile(fullgraph=True). So we compile only when PC is off.
-    # forward_logits (used in eval) is always safe to compile separately.
-    if h.pc_enabled:
-        compiled_model = base_model  # no compile for training forward
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # may break torch.compile(fullgraph=True). Use fullgraph=False so the heavy
+    # ops (attention, MLP) are still compiled while PC list ops cause graph breaks.
+    compiled_model = torch.compile(
+        base_model, dynamic=False,
+        fullgraph=(not h.pc_enabled),
+    )
 
     if h.distributed:
         # PC heads don't receive gradients when pc_alpha=0 (warmup, early steps).
