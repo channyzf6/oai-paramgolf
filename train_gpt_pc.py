@@ -585,6 +585,7 @@ class PredictiveCodingHead(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.proj._pc_head = True  # marker to skip in _init_weights
         nn.init.orthogonal_(self.proj.weight, gain=0.1)
 
     def forward(self, current_hidden, next_hidden_detached):
@@ -704,6 +705,8 @@ class GPT(nn.Module):
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
+                if getattr(module, '_pc_head', False):
+                    continue  # PC heads have their own init (gain=0.1)
                 if getattr(module, '_zero_init', False):
                     nn.init.zeros_(module.weight)
                 elif (module.weight.ndim == 2
@@ -1312,20 +1315,21 @@ def serialize(h, base_model, code):
 
 
 def deserialize(h, device):
-    """Load a quantized model artifact and dequantize."""
-    eval_model = GPT(h).to(device).bfloat16()
+    """Load a quantized model artifact and dequantize.
+    Builds the eval model with PC disabled (no PC heads in artifact)."""
+    # Create a copy of h with PC disabled so eval model has no PC heads
+    eval_h = copy.copy(h)
+    eval_h.pc_enabled = False
+    eval_model = GPT(eval_h).to(device).bfloat16()
     restore_fp32_params(eval_model)
-    # Build template state dict without PC keys
-    sd_cpu = _strip_pc_keys({
-        k: v.detach().cpu() for k, v in eval_model.state_dict().items()
-    })
+    sd_cpu = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
     with open(h.quantized_model_path, 'rb') as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
         io.BytesIO(_decompress(quant_blob_disk, h.compressor)), map_location='cpu',
     )
     deq_state = dequantize_mixed(quant_state['w'], quant_state['m'], sd_cpu)
-    eval_model.load_state_dict(deq_state, strict=False)
+    eval_model.load_state_dict(deq_state, strict=True)
     return eval_model
 
 
@@ -1601,7 +1605,14 @@ def timed_eval(label, fn, *args, **kwargs):
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+
+    # When PC is enabled, collect_hiddens=True uses dynamic Python lists that
+    # break torch.compile(fullgraph=True). So we compile only when PC is off.
+    # forward_logits (used in eval) is always safe to compile separately.
+    if h.pc_enabled:
+        compiled_model = base_model  # no compile for training forward
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
 
     if h.distributed:
         model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
