@@ -166,11 +166,17 @@ class Hyperparameters:
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas  = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
 
-    # ---- Predictive Coding (novel addition) ----
-    pc_enabled            = bool(int(os.environ.get('PC_ENABLED', '1')))
-    pc_alpha              = float(os.environ.get('PC_ALPHA', 0.1))
-    pc_warmup_steps       = int(os.environ.get('PC_WARMUP_STEPS', 200))
-    pc_decay_with_warmdown = bool(int(os.environ.get('PC_DECAY_WITH_WARMDOWN', '1')))
+    # ---- Deep Supervision (novel addition) ----
+    # Intermediate CE loss at selected layers through the shared LM head.
+    # Each selected layer predicts the next token directly — a much more direct
+    # training signal than inter-layer hidden state prediction (PC).
+    ds_enabled            = bool(int(os.environ.get('DS_ENABLED', '1')))
+    ds_alpha              = float(os.environ.get('DS_ALPHA', 0.01))
+    ds_warmup_steps       = int(os.environ.get('DS_WARMUP_STEPS', 200))
+    ds_decay_with_warmdown = bool(int(os.environ.get('DS_DECAY_WITH_WARMDOWN', '1')))
+    # Which physical layers get auxiliary CE loss (comma-separated).
+    # Default: layers 3, 5, 8 — spread across encoder/decoder, skip looped layers.
+    ds_layers             = os.environ.get('DS_LAYERS', '3,5,8')
 
     # Distributed
     distributed     = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
@@ -574,26 +580,30 @@ class Block(nn.Module):
 # Predictive Coding Head (novel addition)
 # ---------------------------------------------------------------------------
 
-class PredictiveCodingHead(nn.Module):
-    """
-    Predicts the next layer's hidden state from the current layer's output.
-    Uses cosine similarity loss so that each layer learns a "forward model"
-    of the representation stream.  Gradients flow back through the current
-    layer (the target is detached), encouraging each layer to produce
-    representations that are predictive of downstream computation.
-    """
-    def __init__(self, d_model):
-        super().__init__()
-        self.proj = nn.Linear(d_model, d_model, bias=False)
-        self.proj._pc_head = True  # marker to skip in _init_weights
-        nn.init.orthogonal_(self.proj.weight, gain=0.1)
+def _compute_ds_loss(x, final_norm, tok_emb_weight, head_proj, lm_head,
+                     tie_embeddings, logit_softcap, targets, layer_frac):
+    """Compute auxiliary CE loss at an intermediate layer.
 
-    def forward(self, current_hidden, next_hidden_detached):
-        pred = self.proj(current_hidden)  # gradients flow back to current layer
-        target = next_hidden_detached     # already detached by caller
-        pred_norm = F.normalize(pred, dim=-1)
-        target_norm = F.normalize(target, dim=-1)
-        return 1.0 - (pred_norm * target_norm).sum(dim=-1).mean()
+    Uses the shared LM head (or tied embeddings) to predict next token
+    from the intermediate hidden state.  Weighted by layer_frac so that
+    deeper layers contribute more to the auxiliary signal.
+
+    No new parameters — reuses the existing LM head.  Zero artifact cost.
+    """
+    h = final_norm(x)
+    if head_proj is not None:
+        h = head_proj(h)
+    if tie_embeddings:
+        logits = F.linear(h, tok_emb_weight)
+    else:
+        logits = lm_head(h)
+    logits = logit_softcap * torch.tanh(logits / logit_softcap)
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)).float(),
+        targets.reshape(-1),
+        reduction='mean',
+    )
+    return loss * layer_frac
 
 
 # ---------------------------------------------------------------------------
@@ -685,21 +695,14 @@ class GPT(nn.Module):
             torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)
         ) if h.skip_gates_enabled else None
 
-        # ---- Predictive Coding heads (training only, stripped before artifact) ----
-        self.pc_enabled = h.pc_enabled
-        # Buffer for PC alpha — updated each step from outside the compiled graph.
-        # Dynamo guards on tensor shape/dtype/device but NOT values, so no recompilation.
-        self.register_buffer('_pc_alpha_buf', torch.zeros(()))
-        if self.pc_enabled:
-            # One PC head per adjacent layer pair (physical layers).
-            # When depth recurrence repeats layers, the same PC head is reused
-            # for the same physical layer pair.
-            self.pc_heads = nn.ModuleList([
-                PredictiveCodingHead(h.model_dim)
-                for _ in range(h.num_layers - 1)
-            ])
-        else:
-            self.pc_heads = None
+        # ---- Deep Supervision (novel addition) ----
+        # No new parameters — reuses the shared LM head at intermediate layers.
+        # Zero artifact cost.  Alpha buffer avoids dynamo recompilation.
+        self.ds_enabled = h.ds_enabled
+        self.register_buffer('_ds_alpha_buf', torch.zeros(()), persistent=False)
+        self.ds_layer_set = set(
+            int(x) for x in h.ds_layers.split(',') if x.strip()
+        ) if h.ds_enabled else set()
 
         self._init_weights()
 
@@ -708,8 +711,6 @@ class GPT(nn.Module):
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                if getattr(module, '_pc_head', False):
-                    continue  # PC heads have their own init (gain=0.1)
                 if getattr(module, '_zero_init', False):
                     nn.init.zeros_(module.weight)
                 elif (module.weight.ndim == 2
@@ -717,13 +718,8 @@ class GPT(nn.Module):
                       and module.weight.shape[1] >= 64):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
-    def _run_blocks(self, x, x0, collect_hiddens=False):
-        """
-        Run the encoder and decoder blocks with skip connections.
-        If collect_hiddens is True, returns a list of (physical_layer_idx, hidden_state)
-        tuples for all virtual layers (needed for PC loss computation).
-        """
-        hiddens = [] if collect_hiddens else None
+    def _run_blocks(self, x, x0):
+        """Run the encoder and decoder blocks with skip connections."""
         skips = []
 
         enc_iter = (self.encoder_indices if self.looping_active
@@ -735,8 +731,6 @@ class GPT(nn.Module):
         # Encoder pass
         for i in enc_iter:
             x = self.blocks[i](x, x0)
-            if collect_hiddens:
-                hiddens.append((i, x))
             skips.append(x)
 
         # Decoder pass with skip connections
@@ -754,21 +748,11 @@ class GPT(nn.Module):
                 else:
                     x = x + scaled_skip
             x = self.blocks[i](x, x0)
-            if collect_hiddens:
-                hiddens.append((i, x))
 
-        return x, hiddens
+        return x
 
-    def forward_logits(self, input_ids):
-        """Compute logits only (used for eval). No PC loss."""
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        if self.embed_proj is not None:
-            x = self.embed_proj(x)
-        x0 = x
-
-        x, _ = self._run_blocks(x, x0, collect_hiddens=False)
-
+    def _compute_logits(self, x):
+        """Shared logit computation for both forward and forward_logits."""
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -778,14 +762,27 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
+    def forward_logits(self, input_ids):
+        """Compute logits only (used for eval)."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        if self.embed_proj is not None:
+            x = self.embed_proj(x)
+        x0 = x
+        x = self._run_blocks(x, x0)
+        return self._compute_logits(x)
+
     def forward(self, input_ids, target_ids):
         """
-        Training forward pass.  Returns CE loss (+ PC auxiliary loss).
+        Training forward pass.  Returns CE loss (+ Deep Supervision aux loss).
 
-        PC alpha is read from self._pc_alpha_buf (a registered buffer).
-        Set it each step via base_model._pc_alpha_buf.fill_(value) BEFORE
-        calling forward.  Because it is a tensor buffer, dynamo does not
-        guard on its value — no recompilation when alpha ramps.
+        When ds_enabled=True, selected intermediate layers predict the next
+        token through the shared LM head.  The auxiliary CE loss is weighted
+        by self._ds_alpha_buf (a registered buffer set each step to avoid
+        dynamo recompilation) and by layer_frac (deeper layers count more).
+
+        No new parameters — no artifact cost.  No dynamic lists — compatible
+        with torch.compile(fullgraph=True).
         """
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -793,38 +790,75 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
 
-        # Control flow depends only on self.pc_enabled (constant bool).
-        need_pc = self.pc_enabled and self.pc_heads is not None
-        x, hiddens = self._run_blocks(x, x0, collect_hiddens=need_pc)
+        # ---- Forward through blocks with optional Deep Supervision ----
+        ds_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        ds_count = 0
+        skips = []
 
-        # Compute logits
-        x = self.final_norm(x)
-        if self.head_proj is not None:
-            x = self.head_proj(x)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        enc_iter = (self.encoder_indices if self.looping_active
+                    else range(self.num_encoder_layers))
+        dec_iter = (self.decoder_indices if self.looping_active
+                    else range(self.num_encoder_layers,
+                               self.num_encoder_layers + self.num_decoder_layers))
+
+        total_virtual = (len(self.encoder_indices) + len(self.decoder_indices)
+                         if self.looping_active
+                         else self.num_encoder_layers + self.num_decoder_layers)
+        virtual_idx = 0
+
+        # Encoder pass
+        for i in enc_iter:
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+            # Deep Supervision: auxiliary CE at selected physical layers
+            if self.ds_enabled and i in self.ds_layer_set:
+                layer_frac = (virtual_idx + 1) / total_virtual
+                ds_loss = ds_loss + _compute_ds_loss(
+                    x, self.final_norm, self.tok_emb.weight,
+                    self.head_proj, self.lm_head,
+                    self.tie_embeddings, self.logit_softcap,
+                    target_ids, layer_frac,
+                )
+                ds_count += 1
+            virtual_idx += 1
+
+        # Decoder pass with skip connections
+        for skip_idx, i in enumerate(dec_iter):
+            if skip_idx < self.num_skip_weights and skips:
+                scaled_skip = (
+                    self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
+                    * skips.pop()
+                )
+                if self.skip_gates is not None:
+                    g = torch.sigmoid(
+                        self.skip_gates[skip_idx].to(dtype=x.dtype)
+                    )[None, None, :]
+                    x = torch.lerp(scaled_skip, x, g)
+                else:
+                    x = x + scaled_skip
+            x = self.blocks[i](x, x0)
+            if self.ds_enabled and i in self.ds_layer_set:
+                layer_frac = (virtual_idx + 1) / total_virtual
+                ds_loss = ds_loss + _compute_ds_loss(
+                    x, self.final_norm, self.tok_emb.weight,
+                    self.head_proj, self.lm_head,
+                    self.tie_embeddings, self.logit_softcap,
+                    target_ids, layer_frac,
+                )
+                ds_count += 1
+            virtual_idx += 1
+
+        # Main CE loss from final layer
+        logits = self._compute_logits(x)
         ce_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(),
             target_ids.reshape(-1),
             reduction='mean',
         )
 
-        # ---- Predictive Coding auxiliary loss ----
-        if need_pc and hiddens is not None and len(hiddens) > 1:
-            pc_loss = torch.zeros((), device=ce_loss.device, dtype=ce_loss.dtype)
-            for vi in range(len(hiddens) - 1):
-                phys_curr, h_curr = hiddens[vi]
-                phys_next, h_next = hiddens[vi + 1]
-                head_idx = min(phys_curr, phys_next)
-                head_idx = min(head_idx, len(self.pc_heads) - 1)
-                pc_loss = pc_loss + self.pc_heads[head_idx](
-                    h_curr, h_next.detach()
-                )
-            pc_loss = pc_loss / (len(hiddens) - 1)
-            return ce_loss + self._pc_alpha_buf * pc_loss
+        # Add weighted Deep Supervision loss
+        if self.ds_enabled and ds_count > 0:
+            return ce_loss + self._ds_alpha_buf * (ds_loss / ds_count)
 
         return ce_loss
 
@@ -1010,20 +1044,7 @@ class Optimizers:
         else:
             self.optimizer_head = None
 
-        # PC heads optimizer — separate Adam, not included in Muon
-        if base_model.pc_heads is not None:
-            pc_params = list(base_model.pc_heads.parameters())
-            if pc_params:
-                self.optimizer_pc = torch.optim.AdamW(
-                    [{'params': pc_params, 'lr': h.matrix_lr, 'base_lr': h.matrix_lr}],
-                    betas=(h.beta1, h.beta2), eps=h.adam_eps,
-                    weight_decay=0.0, fused=True,
-                )
-                self.optimizers.append(self.optimizer_pc)
-            else:
-                self.optimizer_pc = None
-        else:
-            self.optimizer_pc = None
+        # Deep Supervision has no new parameters (reuses shared LM head)
 
     def __iter__(self):
         return iter(self.optimizers)
@@ -1267,9 +1288,7 @@ def _decompress(data, compressor):
 # Serialization / deserialization
 # ---------------------------------------------------------------------------
 
-def _strip_pc_keys(state_dict):
-    """Remove predictive coding head parameters from a state dict."""
-    return {k: v for k, v in state_dict.items() if 'pc_heads' not in k}
+    # (Deep Supervision has no extra parameters to strip)
 
 
 def serialize(h, base_model, code):
@@ -1283,9 +1302,7 @@ def serialize(h, base_model, code):
         log(f"Code size: {code_bytes} bytes")
 
     # Strip PC heads before quantization — they are training-only
-    sd_cpu = _strip_pc_keys({
-        k: v.detach().cpu() for k, v in base_model.state_dict().items()
-    })
+    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     device = torch.device('cuda', h.local_rank)
 
     log('GPTQ:collecting Hessians from calibration data...')
@@ -1315,12 +1332,8 @@ def serialize(h, base_model, code):
 
 
 def deserialize(h, device):
-    """Load a quantized model artifact and dequantize.
-    Builds the eval model with PC disabled (no PC heads in artifact)."""
-    # Create a copy of h with PC disabled so eval model has no PC heads
-    eval_h = copy.copy(h)
-    eval_h.pc_enabled = False
-    eval_model = GPT(eval_h).to(device).bfloat16()
+    """Load a quantized model artifact and dequantize."""
+    eval_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(eval_model)
     sd_cpu = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
     with open(h.quantized_model_path, 'rb') as f:
@@ -1606,22 +1619,13 @@ def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
 
-    # When PC is enabled, collect_hiddens=True uses dynamic Python lists that
-    # may break torch.compile(fullgraph=True). Use fullgraph=False so the heavy
-    # ops (attention, MLP) are still compiled while PC list ops cause graph breaks.
-    compiled_model = torch.compile(
-        base_model, dynamic=False,
-        fullgraph=(not h.pc_enabled),
-    )
+    # Deep Supervision uses no dynamic lists — fullgraph=True is safe.
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
 
     if h.distributed:
-        # PC heads don't receive gradients when pc_alpha=0 (warmup, early steps).
-        # find_unused_parameters=True lets DDP handle this without crashing.
-        model = DDP(
-            compiled_model, device_ids=[h.local_rank],
-            broadcast_buffers=False,
-            find_unused_parameters=h.pc_enabled,
-        )
+        # DS adds no new parameters — all params always participate in the graph.
+        model = DDP(compiled_model, device_ids=[h.local_rank],
+                    broadcast_buffers=False)
     else:
         model = compiled_model
 
@@ -1649,9 +1653,9 @@ def train_model(h, device, val_data):
             return max((1.0 - frac) / h.warmdown_frac, h.min_lr)
         return 1.0
 
-    def step_fn(step, lr_scale, pc_alpha_effective=0.0):
-        # Set PC alpha buffer BEFORE forward (outside compiled graph)
-        base_model._pc_alpha_buf.fill_(pc_alpha_effective)
+    def step_fn(step, lr_scale, ds_alpha_effective=0.0):
+        # Set DS alpha buffer BEFORE forward (outside compiled graph)
+        base_model._ds_alpha_buf.fill_(ds_alpha_effective)
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
@@ -1768,16 +1772,16 @@ def train_model(h, device, val_data):
                 f"encoder:{base_model.encoder_indices} "
                 f"decoder:{base_model.decoder_indices}")
 
-        # ---- Compute effective PC alpha ----
-        # Ramps up over pc_warmup_steps, optionally decays with LR warmdown
-        if h.pc_enabled:
-            pc_warmup_factor = min(step / max(h.pc_warmup_steps, 1), 1.0)
-            pc_warmdown_factor = scale if h.pc_decay_with_warmdown else 1.0
-            pc_alpha_effective = h.pc_alpha * pc_warmup_factor * pc_warmdown_factor
+        # ---- Compute effective DS alpha ----
+        # Ramps up over ds_warmup_steps, optionally decays with LR warmdown
+        if h.ds_enabled:
+            ds_warmup_factor = min(step / max(h.ds_warmup_steps, 1), 1.0)
+            ds_warmdown_factor = scale if h.ds_decay_with_warmdown else 1.0
+            ds_alpha_effective = h.ds_alpha * ds_warmup_factor * ds_warmdown_factor
         else:
-            pc_alpha_effective = 0.0
+            ds_alpha_effective = 0.0
 
-        train_loss = step_fn(step, scale, pc_alpha_effective=pc_alpha_effective)
+        train_loss = step_fn(step, scale, ds_alpha_effective=ds_alpha_effective)
 
         # EMA update
         with torch.no_grad():
