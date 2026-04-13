@@ -777,12 +777,12 @@ class GPT(nn.Module):
 
     def forward(self, input_ids, target_ids, pc_alpha=0.0):
         """
-        Training forward pass.  Returns CE loss (+ PC auxiliary loss if pc_alpha > 0).
+        Training forward pass.  Returns CE loss (+ PC auxiliary loss).
 
-        Args:
-            input_ids:  (B, T) input token ids
-            target_ids: (B, T) target token ids
-            pc_alpha:   effective PC loss weight (0 = disabled)
+        pc_alpha is converted to a tensor so torch._dynamo does not
+        recompile when its value changes (it ramps during warmup).
+        The control flow depends only on self.pc_enabled (a bool attribute
+        that dynamo specializes on once), never on the float value of alpha.
         """
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -790,7 +790,9 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
 
-        need_pc = self.pc_enabled and self.pc_heads is not None and pc_alpha > 0.0
+        # Control flow depends only on self.pc_enabled (constant bool),
+        # NOT on pc_alpha (which changes every step). This avoids recompilation.
+        need_pc = self.pc_enabled and self.pc_heads is not None
         x, hiddens = self._run_blocks(x, x0, collect_hiddens=need_pc)
 
         # Compute logits
@@ -814,17 +816,15 @@ class GPT(nn.Module):
             for vi in range(len(hiddens) - 1):
                 phys_curr, h_curr = hiddens[vi]
                 phys_next, h_next = hiddens[vi + 1]
-                # PC head index = min(phys_curr, phys_next) clamped to valid range.
-                # For consecutive physical layers i -> j, use head min(i, j).
-                # This ensures the same head is reused for the same physical
-                # layer pair during depth recurrence loops.
                 head_idx = min(phys_curr, phys_next)
                 head_idx = min(head_idx, len(self.pc_heads) - 1)
                 pc_loss = pc_loss + self.pc_heads[head_idx](
                     h_curr, h_next.detach()
                 )
             pc_loss = pc_loss / (len(hiddens) - 1)
-            return ce_loss + pc_alpha * pc_loss
+            # Wrap alpha as tensor so dynamo doesn't guard on its float value
+            alpha_t = torch.tensor(pc_alpha, device=ce_loss.device, dtype=ce_loss.dtype)
+            return ce_loss + alpha_t * pc_loss
 
         return ce_loss
 
