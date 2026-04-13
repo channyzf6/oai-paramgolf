@@ -1748,6 +1748,8 @@ def train_model(h, device, val_data):
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1e3 * (time.perf_counter() - t0)
+            # Zero DS alpha so validation loss is pure CE (comparable to baseline)
+            base_model._ds_alpha_buf.fill_(0.0)
             val_loss, val_bpb = eval_val(h, device, val_data, model)
             log(f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}")
             torch.cuda.synchronize()
@@ -1844,6 +1846,7 @@ def train_and_eval(h, device):
     base_model, compiled_model = train_model(h, device, val_data)
     torch._dynamo.reset()
 
+    base_model._ds_alpha_buf.fill_(0.0)  # pure CE for eval
     timed_eval('pre-quantization post-ema', eval_val, h, device, val_data, compiled_model)
     serialize(h, base_model, Path(__file__).read_text(encoding='utf-8'))
 
