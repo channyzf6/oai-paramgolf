@@ -9,3 +9,5 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+PREDICTIVE_CODING_PLAN.md
+PARAMETER_GOLF_PLAN.md
