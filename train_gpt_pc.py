@@ -687,6 +687,9 @@ class GPT(nn.Module):
 
         # ---- Predictive Coding heads (training only, stripped before artifact) ----
         self.pc_enabled = h.pc_enabled
+        # Buffer for PC alpha — updated each step from outside the compiled graph.
+        # Dynamo guards on tensor shape/dtype/device but NOT values, so no recompilation.
+        self.register_buffer('_pc_alpha_buf', torch.zeros(1))
         if self.pc_enabled:
             # One PC head per adjacent layer pair (physical layers).
             # When depth recurrence repeats layers, the same PC head is reused
@@ -775,14 +778,14 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids, target_ids, pc_alpha=0.0):
+    def forward(self, input_ids, target_ids):
         """
         Training forward pass.  Returns CE loss (+ PC auxiliary loss).
 
-        pc_alpha is converted to a tensor so torch._dynamo does not
-        recompile when its value changes (it ramps during warmup).
-        The control flow depends only on self.pc_enabled (a bool attribute
-        that dynamo specializes on once), never on the float value of alpha.
+        PC alpha is read from self._pc_alpha_buf (a registered buffer).
+        Set it each step via base_model._pc_alpha_buf.fill_(value) BEFORE
+        calling forward.  Because it is a tensor buffer, dynamo does not
+        guard on its value — no recompilation when alpha ramps.
         """
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -790,8 +793,7 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
 
-        # Control flow depends only on self.pc_enabled (constant bool),
-        # NOT on pc_alpha (which changes every step). This avoids recompilation.
+        # Control flow depends only on self.pc_enabled (constant bool).
         need_pc = self.pc_enabled and self.pc_heads is not None
         x, hiddens = self._run_blocks(x, x0, collect_hiddens=need_pc)
 
@@ -822,9 +824,7 @@ class GPT(nn.Module):
                     h_curr, h_next.detach()
                 )
             pc_loss = pc_loss / (len(hiddens) - 1)
-            # Wrap alpha as tensor so dynamo doesn't guard on its float value
-            alpha_t = torch.tensor(pc_alpha, device=ce_loss.device, dtype=ce_loss.dtype)
-            return ce_loss + alpha_t * pc_loss
+            return ce_loss + self._pc_alpha_buf * pc_loss
 
         return ce_loss
 
@@ -1650,6 +1650,8 @@ def train_model(h, device, val_data):
         return 1.0
 
     def step_fn(step, lr_scale, pc_alpha_effective=0.0):
+        # Set PC alpha buffer BEFORE forward (outside compiled graph)
+        base_model._pc_alpha_buf.fill_(pc_alpha_effective)
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
@@ -1659,7 +1661,7 @@ def train_model(h, device, val_data):
                 )
             x, y = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, pc_alpha=pc_alpha_effective)
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
 
