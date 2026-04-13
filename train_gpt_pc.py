@@ -1615,7 +1615,13 @@ def train_model(h, device, val_data):
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
 
     if h.distributed:
-        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
+        # PC heads don't receive gradients when pc_alpha=0 (warmup, early steps).
+        # find_unused_parameters=True lets DDP handle this without crashing.
+        model = DDP(
+            compiled_model, device_ids=[h.local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=h.pc_enabled,
+        )
     else:
         model = compiled_model
 
