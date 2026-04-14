@@ -687,6 +687,11 @@ class MTPHead(nn.Module):
         super().__init__()
         self.norm = RMSNorm()
         self.proj = CastedLinear(dim, dim, bias=False)
+        # Zero-init so MTPHead starts as identity residual (matches MTPBlock
+        # convention via attn.proj/mlp.proj._zero_init). Without this, the
+        # orthogonal init from _init_weights would inject random perturbation
+        # at step 0, making MTP gradients noisy during early training.
+        self.proj._zero_init = True
 
     def forward(self, x):
         return x + self.proj(self.norm(x))
@@ -850,6 +855,11 @@ class GPT(nn.Module):
         self.mtp_decay_per_horizon = h.mtp_decay_per_horizon
         self.register_buffer('_mtp_alpha_buf', torch.zeros(()), persistent=False)
         if self.mtp_enabled and self.mtp_horizons > 0:
+            if h.mtp_head_style not in ('medusa', 'block'):
+                raise ValueError(
+                    f"Unknown MTP_HEAD_STYLE: {h.mtp_head_style!r}; "
+                    "expected 'medusa' or 'block'"
+                )
             if h.mtp_head_style == 'medusa':
                 # Lightweight: RMSNorm + Linear per horizon (Medusa-style)
                 self.mtp_blocks = nn.ModuleList([
