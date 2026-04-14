@@ -680,13 +680,18 @@ def _compute_mtp_loss(h, mtp_blocks, final_norm, tok_emb_weight, head_proj, lm_h
         h = mtp_blocks[k-2](h)  — advance representation by one more horizon
         compute CE(h, input_ids[:, k:])
         weight by alpha * decay_per_horizon^(k-2)
+
+    Returns a weighted SUM (not average) — outer alpha buffer controls scale.
     """
+    T = h.size(1)
     total_loss = torch.zeros((), device=h.device, dtype=torch.float32)
-    total_weight = 0.0
     h_advanced = h
     for k_idx, mtp_block in enumerate(mtp_blocks):
         # Horizon k = k_idx + 2 (first MTP horizon is t+2)
         k = k_idx + 2
+        if k >= T:
+            # Sequence too short for this horizon; skip remaining horizons.
+            break
         # Advance the hidden state by one more token horizon
         h_advanced = mtp_block(h_advanced)
         # Compute logits from advanced hidden state (all positions)
@@ -708,9 +713,6 @@ def _compute_mtp_loss(h, mtp_blocks, final_norm, tok_emb_weight, head_proj, lm_h
         )
         w = alpha * (decay_per_horizon ** k_idx)
         total_loss = total_loss + w * loss
-        total_weight += w
-    if total_weight > 0:
-        return total_loss / total_weight
     return total_loss
 
 
@@ -830,6 +832,15 @@ class GPT(nn.Module):
                          h.rope_base, h.qk_gain_init, h.train_seq_len)
                 for _ in range(self.mtp_horizons)
             ])
+            # Apply same rope_dims override as main blocks for consistency
+            if h.rope_dims > 0:
+                head_dim = h.model_dim // h.num_heads
+                for block in self.mtp_blocks:
+                    block.attn.rope_dims = h.rope_dims
+                    block.attn.rotary = Rotary(
+                        head_dim, base=h.rope_base,
+                        train_seq_len=h.train_seq_len, rope_dims=h.rope_dims,
+                    )
         else:
             self.mtp_blocks = None
 
@@ -968,7 +979,7 @@ class GPT(nn.Module):
                         self.tie_embeddings, self.logit_softcap,
                         input_ids, self.mtp_horizons,
                         1.0,  # alpha handled externally via buffer
-                        1.0,  # decay handled in _compute_mtp_loss is per-horizon, keep raw
+                        self.mtp_decay_per_horizon,
                     )
                     mtp_count += 1
             virtual_idx += 1
