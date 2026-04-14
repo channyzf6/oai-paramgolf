@@ -174,6 +174,12 @@ class Hyperparameters:
     ds_alpha              = float(os.environ.get('DS_ALPHA', 0.01))
     ds_warmup_steps       = int(os.environ.get('DS_WARMUP_STEPS', 200))
     ds_decay_with_warmdown = bool(int(os.environ.get('DS_DECAY_WITH_WARMDOWN', '1')))
+    # Fraction-based DS decay — decouples DS from final EMA averaging.
+    # Alpha = full from 0 to ds_decay_start_frac, linearly decays to 0 by ds_decay_end_frac,
+    # then 0 for the rest. Scales to any training duration.
+    # Default: decay 70%-85% of training → last 15% is clean baseline for EMA.
+    ds_decay_start_frac   = float(os.environ.get('DS_DECAY_START_FRAC', 0.70))
+    ds_decay_end_frac     = float(os.environ.get('DS_DECAY_END_FRAC', 0.85))
     # Which physical layers get auxiliary CE loss (comma-separated).
     # Default: layers 3, 5, 8 — spread across encoder/decoder, skip looped layers.
     ds_layers             = os.environ.get('DS_LAYERS', '3,5,8')
@@ -1775,11 +1781,22 @@ def train_model(h, device, val_data):
                 f"decoder:{base_model.decoder_indices}")
 
         # ---- Compute effective DS alpha ----
-        # Ramps up over ds_warmup_steps, optionally decays with LR warmdown
+        # Step-based warmup + fraction-based decay (+ optional LR warmdown coupling).
+        # The fraction-based decay ensures EMA captures clean post-DS weights.
         if h.ds_enabled:
             ds_warmup_factor = min(step / max(h.ds_warmup_steps, 1), 1.0)
+            # Fraction-based decay: 1.0 before ds_decay_start_frac,
+            # linearly decays to 0 by ds_decay_end_frac, then 0
+            if frac < h.ds_decay_start_frac:
+                ds_frac_factor = 1.0
+            elif frac < h.ds_decay_end_frac:
+                span = max(h.ds_decay_end_frac - h.ds_decay_start_frac, 1e-9)
+                ds_frac_factor = 1.0 - (frac - h.ds_decay_start_frac) / span
+            else:
+                ds_frac_factor = 0.0
             ds_warmdown_factor = scale if h.ds_decay_with_warmdown else 1.0
-            ds_alpha_effective = h.ds_alpha * ds_warmup_factor * ds_warmdown_factor
+            ds_alpha_effective = (h.ds_alpha * ds_warmup_factor
+                                  * ds_frac_factor * ds_warmdown_factor)
         else:
             ds_alpha_effective = 0.0
 
