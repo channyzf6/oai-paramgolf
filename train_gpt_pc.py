@@ -187,6 +187,13 @@ class Hyperparameters:
     # computing all auxiliary losses. Reduces compute overhead ~3x, enabling
     # more training steps. Based on "switched auxiliary loss" literature.
     ds_switched           = bool(int(os.environ.get('DS_SWITCHED', '0')))
+    # Top-K sampled softmax for DS aux losses: compute logits against
+    # [target + K random negatives] instead of full vocab. Reduces DS aux
+    # loss LM head cost by ~16x for K=512 on V=8192. Training-only — main
+    # CE and eval still use full vocab. Zero artifact cost.
+    # Set DS_TOPK=0 to disable (use full-vocab CE for DS aux).
+    # Based on Jean et al. 2014 "Sampled Softmax" and NCE literature.
+    ds_topk               = int(os.environ.get('DS_TOPK', 0))
 
     # Distributed
     distributed     = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
@@ -591,28 +598,54 @@ class Block(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _compute_ds_loss(x, final_norm, tok_emb_weight, head_proj, lm_head,
-                     tie_embeddings, logit_softcap, targets, layer_frac):
+                     tie_embeddings, logit_softcap, targets, layer_frac,
+                     topk_neg_ids=None):
     """Compute auxiliary CE loss at an intermediate layer.
 
     Uses the shared LM head (or tied embeddings) to predict next token
     from the intermediate hidden state.  Weighted by layer_frac so that
     deeper layers contribute more to the auxiliary signal.
 
+    When topk_neg_ids is provided, uses sampled softmax over
+    [target + K random negatives] instead of full vocab, reducing cost
+    by ~V/(K+1) (e.g., 16x for K=512 on V=8192).  This biases the loss
+    away from rare tokens but preserves the gradient direction.
+
     No new parameters — reuses the existing LM head.  Zero artifact cost.
     """
     h = final_norm(x)
     if head_proj is not None:
         h = head_proj(h)
-    if tie_embeddings:
-        logits = F.linear(h, tok_emb_weight)
+    if topk_neg_ids is None:
+        # Full-vocab CE (original path)
+        if tie_embeddings:
+            logits = F.linear(h, tok_emb_weight)
+        else:
+            logits = lm_head(h)
+        logits = logit_softcap * torch.tanh(logits / logit_softcap)
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)).float(),
+            targets.reshape(-1),
+            reduction='mean',
+        )
     else:
-        logits = lm_head(h)
-    logits = logit_softcap * torch.tanh(logits / logit_softcap)
-    loss = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)).float(),
-        targets.reshape(-1),
-        reduction='mean',
-    )
+        # Sampled softmax: logits against target + K negatives only
+        # NOTE: only supports tied embeddings path (lm_head=None)
+        h_flat = h.reshape(-1, h.size(-1))         # (B*T, D)
+        targets_flat = targets.reshape(-1)          # (B*T,)
+        target_embs = tok_emb_weight[targets_flat]  # (B*T, D)
+        neg_embs = tok_emb_weight[topk_neg_ids]     # (K, D)
+        # Logit for each position's own target
+        target_logit = (h_flat * target_embs).sum(dim=-1, keepdim=True)  # (B*T, 1)
+        # Logits for shared K negatives
+        neg_logits = h_flat @ neg_embs.T  # (B*T, K)
+        # Concatenate: target at index 0
+        combined = torch.cat([target_logit, neg_logits], dim=-1)  # (B*T, K+1)
+        combined = logit_softcap * torch.tanh(combined / logit_softcap)
+        # CE: target is always at index 0 in this subset
+        label = torch.zeros(combined.size(0), dtype=torch.long,
+                           device=combined.device)
+        loss = F.cross_entropy(combined.float(), label, reduction='mean')
     return loss * layer_frac
 
 
@@ -710,7 +743,19 @@ class GPT(nn.Module):
         # Zero artifact cost.  Alpha buffer avoids dynamo recompilation.
         self.ds_enabled = h.ds_enabled
         self.ds_switched = h.ds_switched
+        self.ds_topk = h.ds_topk if h.ds_enabled else 0
+        self.vocab_size = h.vocab_size
         self.register_buffer('_ds_alpha_buf', torch.zeros(()), persistent=False)
+        # Top-K negative indices buffer (updated each step from training loop
+        # when ds_topk > 0). Shape: (ds_topk,) of int64 token ids.
+        if self.ds_topk > 0:
+            self.register_buffer(
+                '_ds_topk_neg_ids',
+                torch.zeros(self.ds_topk, dtype=torch.long),
+                persistent=False,
+            )
+        else:
+            self._ds_topk_neg_ids = None
         self.ds_layer_set = set(
             int(x) for x in h.ds_layers.split(',') if x.strip()
         ) if h.ds_enabled else set()
@@ -842,6 +887,7 @@ class GPT(nn.Module):
                     self.head_proj, self.lm_head,
                     self.tie_embeddings, self.logit_softcap,
                     target_ids, layer_frac,
+                    topk_neg_ids=self._ds_topk_neg_ids if self.ds_topk > 0 else None,
                 )
                 ds_count += 1
             virtual_idx += 1
@@ -868,6 +914,7 @@ class GPT(nn.Module):
                     self.head_proj, self.lm_head,
                     self.tie_embeddings, self.logit_softcap,
                     target_ids, layer_frac,
+                    topk_neg_ids=self._ds_topk_neg_ids if self.ds_topk > 0 else None,
                 )
                 ds_count += 1
             virtual_idx += 1
@@ -1688,6 +1735,14 @@ def train_model(h, device, val_data):
         # Switched DS: pick one random layer to supervise this step
         if h.ds_switched and base_model.ds_layer_list:
             base_model._ds_current_layer = random.choice(base_model.ds_layer_list)
+        # Top-K sampled softmax: refresh random negative IDs each step.
+        # Uniform sampling over vocab. Same negatives shared across all
+        # positions and DS layers for this step (cheap + cache-friendly).
+        if h.ds_topk > 0 and ds_alpha_effective > 0.0:
+            torch.randint(
+                0, base_model.vocab_size, (h.ds_topk,),
+                out=base_model._ds_topk_neg_ids,
+            )
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
