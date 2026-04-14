@@ -183,6 +183,10 @@ class Hyperparameters:
     # Which physical layers get auxiliary CE loss (comma-separated).
     # Default: layers 3, 5, 8 — spread across encoder/decoder, skip looped layers.
     ds_layers             = os.environ.get('DS_LAYERS', '3,5,8')
+    # Switched DS: pick ONE random layer from ds_layers each step instead of
+    # computing all auxiliary losses. Reduces compute overhead ~3x, enabling
+    # more training steps. Based on "switched auxiliary loss" literature.
+    ds_switched           = bool(int(os.environ.get('DS_SWITCHED', '0')))
 
     # Distributed
     distributed     = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
@@ -705,10 +709,15 @@ class GPT(nn.Module):
         # No new parameters — reuses the shared LM head at intermediate layers.
         # Zero artifact cost.  Alpha buffer avoids dynamo recompilation.
         self.ds_enabled = h.ds_enabled
+        self.ds_switched = h.ds_switched
         self.register_buffer('_ds_alpha_buf', torch.zeros(()), persistent=False)
         self.ds_layer_set = set(
             int(x) for x in h.ds_layers.split(',') if x.strip()
         ) if h.ds_enabled else set()
+        self.ds_layer_list = sorted(self.ds_layer_set)  # for random selection
+        # -1 means "use all DS layers" (non-switched mode).
+        # Set to a specific layer index from training loop for switched mode.
+        self._ds_current_layer = -1
 
         self._init_weights()
 
@@ -812,12 +821,21 @@ class GPT(nn.Module):
                          else self.num_encoder_layers + self.num_decoder_layers)
         virtual_idx = 0
 
+        # Helper: should we apply DS at this physical layer index?
+        # In non-switched mode: apply at all ds_layer_set layers.
+        # In switched mode: apply ONLY at the current selected layer.
+        def _ds_active_at(layer_idx):
+            if not self.ds_enabled or layer_idx not in self.ds_layer_set:
+                return False
+            if self.ds_switched:
+                return layer_idx == self._ds_current_layer
+            return True
+
         # Encoder pass
         for i in enc_iter:
             x = self.blocks[i](x, x0)
             skips.append(x)
-            # Deep Supervision: auxiliary CE at selected physical layers
-            if self.ds_enabled and i in self.ds_layer_set:
+            if _ds_active_at(i):
                 layer_frac = (virtual_idx + 1) / total_virtual
                 ds_loss = ds_loss + _compute_ds_loss(
                     x, self.final_norm, self.tok_emb.weight,
@@ -843,7 +861,7 @@ class GPT(nn.Module):
                 else:
                     x = x + scaled_skip
             x = self.blocks[i](x, x0)
-            if self.ds_enabled and i in self.ds_layer_set:
+            if _ds_active_at(i):
                 layer_frac = (virtual_idx + 1) / total_virtual
                 ds_loss = ds_loss + _compute_ds_loss(
                     x, self.final_norm, self.tok_emb.weight,
@@ -1625,8 +1643,13 @@ def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
 
-    # Deep Supervision uses no dynamic lists — fullgraph=True is safe.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # Deep Supervision: fullgraph=True when non-switched (static control flow).
+    # Switched DS changes _ds_current_layer each step, so use fullgraph=False
+    # to avoid recompilation penalty (dynamo would recompile per unique value).
+    compiled_model = torch.compile(
+        base_model, dynamic=False,
+        fullgraph=(not h.ds_switched),
+    )
 
     if h.distributed:
         # DS adds no new parameters — all params always participate in the graph.
@@ -1662,6 +1685,9 @@ def train_model(h, device, val_data):
     def step_fn(step, lr_scale, ds_alpha_effective=0.0):
         # Set DS alpha buffer BEFORE forward (outside compiled graph)
         base_model._ds_alpha_buf.fill_(ds_alpha_effective)
+        # Switched DS: pick one random layer to supervise this step
+        if h.ds_switched and base_model.ds_layer_list:
+            base_model._ds_current_layer = random.choice(base_model.ds_layer_list)
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
