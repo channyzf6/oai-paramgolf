@@ -206,6 +206,9 @@ class Hyperparameters:
     # MTP curriculum: ramp alpha from 0 over first mtp_warmup_steps
     # (small-scale MTP benefits from curriculum per Aynetdinov & Akbik 2025)
     mtp_warmup_steps      = int(os.environ.get('MTP_WARMUP_STEPS', 1000))
+    # Head style: 'block' uses full transformer blocks (expensive, expressive),
+    # 'medusa' uses RMSNorm + Linear (cheap, less expressive).
+    mtp_head_style        = os.environ.get('MTP_HEAD_STYLE', 'block')
 
     # Distributed
     distributed     = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
@@ -669,6 +672,26 @@ class MTPBlock(nn.Module):
         return x
 
 
+class MTPHead(nn.Module):
+    """Medusa-style lightweight MTP head: single RMSNorm + Linear projection.
+
+    Replaces the full transformer MTPBlock with ~10x less compute.
+    Trade-off: less expressive than MTPBlock, but preserves the auxiliary
+    gradient signal at a fraction of the cost.
+
+    Based on Medusa (Cai et al. 2024) which uses single-linear heads for
+    multi-token prediction at inference time; we apply the same for
+    training-time auxiliary supervision.
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.proj = CastedLinear(dim, dim, bias=False)
+
+    def forward(self, x):
+        return x + self.proj(self.norm(x))
+
+
 def _compute_mtp_loss(h, mtp_blocks, final_norm, tok_emb_weight, head_proj, lm_head,
                      tie_embeddings, logit_softcap, input_ids,
                      num_horizons, alpha, decay_per_horizon):
@@ -827,20 +850,28 @@ class GPT(nn.Module):
         self.mtp_decay_per_horizon = h.mtp_decay_per_horizon
         self.register_buffer('_mtp_alpha_buf', torch.zeros(()), persistent=False)
         if self.mtp_enabled and self.mtp_horizons > 0:
-            self.mtp_blocks = nn.ModuleList([
-                MTPBlock(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
-                         h.rope_base, h.qk_gain_init, h.train_seq_len)
-                for _ in range(self.mtp_horizons)
-            ])
-            # Apply same rope_dims override as main blocks for consistency
-            if h.rope_dims > 0:
-                head_dim = h.model_dim // h.num_heads
-                for block in self.mtp_blocks:
-                    block.attn.rope_dims = h.rope_dims
-                    block.attn.rotary = Rotary(
-                        head_dim, base=h.rope_base,
-                        train_seq_len=h.train_seq_len, rope_dims=h.rope_dims,
-                    )
+            if h.mtp_head_style == 'medusa':
+                # Lightweight: RMSNorm + Linear per horizon (Medusa-style)
+                self.mtp_blocks = nn.ModuleList([
+                    MTPHead(h.model_dim)
+                    for _ in range(self.mtp_horizons)
+                ])
+            else:
+                # Full transformer block per horizon (DeepSeek/Gloeckle-style)
+                self.mtp_blocks = nn.ModuleList([
+                    MTPBlock(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
+                             h.rope_base, h.qk_gain_init, h.train_seq_len)
+                    for _ in range(self.mtp_horizons)
+                ])
+                # Apply same rope_dims override as main blocks for consistency
+                if h.rope_dims > 0:
+                    head_dim = h.model_dim // h.num_heads
+                    for block in self.mtp_blocks:
+                        block.attn.rope_dims = h.rope_dims
+                        block.attn.rotary = Rotary(
+                            head_dim, base=h.rope_base,
+                            train_seq_len=h.train_seq_len, rope_dims=h.rope_dims,
+                        )
         else:
             self.mtp_blocks = None
 
