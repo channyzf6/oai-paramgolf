@@ -188,6 +188,25 @@ class Hyperparameters:
     # more training steps. Based on "switched auxiliary loss" literature.
     ds_switched           = bool(int(os.environ.get('DS_SWITCHED', '0')))
 
+    # ---- Multi-Token Prediction (MTP) — novel addition ----
+    # At each DS-supervised layer, also predict tokens t+2, t+3 (and beyond)
+    # via small auxiliary transformer blocks that share the LM head.
+    # Combines with DS to create a 2D supervision grid (depth × time).
+    # Based on Gloeckle et al. (Meta 2024) "Better & Faster LLMs via MTP"
+    # and DeepSeek-V3 technical report.
+    # MTP blocks are training-only: stripped before quantization (zero artifact cost).
+    mtp_enabled           = bool(int(os.environ.get('MTP_ENABLED', '0')))
+    # Number of additional horizons beyond t+1 (DS already covers t+1).
+    # e.g., MTP_HORIZONS=2 means also predict t+2 and t+3 at each DS layer.
+    mtp_horizons          = int(os.environ.get('MTP_HORIZONS', 2))
+    # Per-horizon weight decay: first extra horizon weighted at mtp_alpha,
+    # each further horizon scaled down by mtp_decay_per_horizon.
+    mtp_alpha             = float(os.environ.get('MTP_ALPHA', 0.2))
+    mtp_decay_per_horizon = float(os.environ.get('MTP_DECAY_PER_HORIZON', 0.7))
+    # MTP curriculum: ramp alpha from 0 over first mtp_warmup_steps
+    # (small-scale MTP benefits from curriculum per Aynetdinov & Akbik 2025)
+    mtp_warmup_steps      = int(os.environ.get('MTP_WARMUP_STEPS', 1000))
+
     # Distributed
     distributed     = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     rank            = int(os.environ.get('RANK', '0'))
@@ -617,6 +636,85 @@ def _compute_ds_loss(x, final_norm, tok_emb_weight, head_proj, lm_head,
 
 
 # ---------------------------------------------------------------------------
+# Multi-Token Prediction Block (novel combination with DS)
+# ---------------------------------------------------------------------------
+
+class MTPBlock(nn.Module):
+    """Small transformer block that advances a hidden state by one token horizon.
+
+    Used to enable predicting token t+k from hidden state at position t.
+    For horizon k, apply mtp_block k-1 times, then feed to shared LM head.
+
+    Training-only: stripped from artifact before quantization.
+    Structure mirrors the main Block for consistency — same RMSNorm,
+    CausalSelfAttention, MLP with LeakyReLU(0.5)^2.
+    """
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base,
+                 qk_gain_init, train_seq_len):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = CausalSelfAttention(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len,
+        )
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x):
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_out = self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        return x
+
+
+def _compute_mtp_loss(h, mtp_blocks, final_norm, tok_emb_weight, head_proj, lm_head,
+                     tie_embeddings, logit_softcap, input_ids,
+                     num_horizons, alpha, decay_per_horizon):
+    """Compute MTP auxiliary losses for horizons t+2, t+3, ..., t+(num_horizons+1).
+
+    h: hidden state at DS layer (B, T, D)
+    mtp_blocks: list of K-1 MTP blocks for horizons beyond k=1.  k=1 handled by DS.
+    For horizon k=2..num_horizons+1:
+        h = mtp_blocks[k-2](h)  — advance representation by one more horizon
+        compute CE(h, input_ids[:, k:])
+        weight by alpha * decay_per_horizon^(k-2)
+    """
+    total_loss = torch.zeros((), device=h.device, dtype=torch.float32)
+    total_weight = 0.0
+    h_advanced = h
+    for k_idx, mtp_block in enumerate(mtp_blocks):
+        # Horizon k = k_idx + 2 (first MTP horizon is t+2)
+        k = k_idx + 2
+        # Advance the hidden state by one more token horizon
+        h_advanced = mtp_block(h_advanced)
+        # Compute logits from advanced hidden state (all positions)
+        normed = final_norm(h_advanced)
+        if head_proj is not None:
+            normed = head_proj(normed)
+        if tie_embeddings:
+            logits = F.linear(normed, tok_emb_weight)
+        else:
+            logits = lm_head(normed)
+        logits = logit_softcap * torch.tanh(logits / logit_softcap)
+        # Align predictions with targets: position i of h predicts input_ids[:, i+k]
+        pred_logits = logits[:, :-k, :]   # (B, T-k, V)
+        targets = input_ids[:, k:]         # (B, T-k)
+        loss = F.cross_entropy(
+            pred_logits.reshape(-1, pred_logits.size(-1)).float(),
+            targets.reshape(-1),
+            reduction='mean',
+        )
+        w = alpha * (decay_per_horizon ** k_idx)
+        total_loss = total_loss + w * loss
+        total_weight += w
+    if total_weight > 0:
+        return total_loss / total_weight
+    return total_loss
+
+
+# ---------------------------------------------------------------------------
 # GPT model
 # ---------------------------------------------------------------------------
 
@@ -719,6 +817,22 @@ class GPT(nn.Module):
         # Set to a specific layer index from training loop for switched mode.
         self._ds_current_layer = -1
 
+        # ---- Multi-Token Prediction (novel: combines with DS) ----
+        # mtp_horizons extra blocks (for t+2, t+3, ..., t+(horizons+1))
+        # STRIPPED from artifact before quantization — zero artifact cost.
+        self.mtp_enabled = h.mtp_enabled and h.ds_enabled
+        self.mtp_horizons = h.mtp_horizons if self.mtp_enabled else 0
+        self.mtp_decay_per_horizon = h.mtp_decay_per_horizon
+        self.register_buffer('_mtp_alpha_buf', torch.zeros(()), persistent=False)
+        if self.mtp_enabled and self.mtp_horizons > 0:
+            self.mtp_blocks = nn.ModuleList([
+                MTPBlock(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
+                         h.rope_base, h.qk_gain_init, h.train_seq_len)
+                for _ in range(self.mtp_horizons)
+            ])
+        else:
+            self.mtp_blocks = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -805,9 +919,11 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
 
-        # ---- Forward through blocks with optional Deep Supervision ----
+        # ---- Forward through blocks with optional Deep Supervision + MTP ----
         ds_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         ds_count = 0
+        mtp_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        mtp_count = 0
         skips = []
 
         enc_iter = (self.encoder_indices if self.looping_active
@@ -844,6 +960,17 @@ class GPT(nn.Module):
                     target_ids, layer_frac,
                 )
                 ds_count += 1
+                # MTP: also predict t+2, t+3 ... at this DS layer
+                if self.mtp_enabled and self.mtp_blocks is not None:
+                    mtp_loss = mtp_loss + _compute_mtp_loss(
+                        x, self.mtp_blocks, self.final_norm, self.tok_emb.weight,
+                        self.head_proj, self.lm_head,
+                        self.tie_embeddings, self.logit_softcap,
+                        input_ids, self.mtp_horizons,
+                        1.0,  # alpha handled externally via buffer
+                        1.0,  # decay handled in _compute_mtp_loss is per-horizon, keep raw
+                    )
+                    mtp_count += 1
             virtual_idx += 1
 
         # Decoder pass with skip connections
@@ -870,6 +997,15 @@ class GPT(nn.Module):
                     target_ids, layer_frac,
                 )
                 ds_count += 1
+                if self.mtp_enabled and self.mtp_blocks is not None:
+                    mtp_loss = mtp_loss + _compute_mtp_loss(
+                        x, self.mtp_blocks, self.final_norm, self.tok_emb.weight,
+                        self.head_proj, self.lm_head,
+                        self.tie_embeddings, self.logit_softcap,
+                        input_ids, self.mtp_horizons,
+                        1.0, self.mtp_decay_per_horizon,
+                    )
+                    mtp_count += 1
             virtual_idx += 1
 
         # Main CE loss from final layer
@@ -880,11 +1016,13 @@ class GPT(nn.Module):
             reduction='mean',
         )
 
-        # Add weighted Deep Supervision loss
+        # Combine main CE + Deep Supervision + MTP losses
+        total = ce_loss
         if self.ds_enabled and ds_count > 0:
-            return ce_loss + self._ds_alpha_buf * (ds_loss / ds_count)
-
-        return ce_loss
+            total = total + self._ds_alpha_buf * (ds_loss / ds_count)
+        if self.mtp_enabled and mtp_count > 0:
+            total = total + self._mtp_alpha_buf * (mtp_loss / mtp_count)
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1152,13 @@ class Optimizers:
     """
     def __init__(self, h, base_model):
         block_named_params = list(base_model.blocks.named_parameters())
+        # Include MTP blocks if present — they train alongside main blocks
+        if base_model.mtp_blocks is not None:
+            mtp_named_params = [
+                (f'mtp_blocks.{n}', p)
+                for n, p in base_model.mtp_blocks.named_parameters()
+            ]
+            block_named_params = block_named_params + mtp_named_params
         matrix_params = [
             p for (name, p) in block_named_params
             if p.ndim == 2 and not any(
@@ -1325,8 +1470,9 @@ def serialize(h, base_model, code):
         log(f"Serialized model: {model_bytes} bytes")
         log(f"Code size: {code_bytes} bytes")
 
-    # Strip PC heads before quantization — they are training-only
-    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+    # Strip training-only modules (MTP blocks) before quantization
+    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()
+              if not k.startswith('mtp_blocks')}
     device = torch.device('cuda', h.local_rank)
 
     log('GPTQ:collecting Hessians from calibration data...')
@@ -1356,8 +1502,11 @@ def serialize(h, base_model, code):
 
 
 def deserialize(h, device):
-    """Load a quantized model artifact and dequantize."""
-    eval_model = GPT(h).to(device).bfloat16()
+    """Load a quantized model artifact and dequantize.
+    Builds eval model with MTP disabled (no training-only blocks)."""
+    eval_h = copy.copy(h)
+    eval_h.mtp_enabled = False  # Artifact has no MTP blocks
+    eval_model = GPT(eval_h).to(device).bfloat16()
     restore_fp32_params(eval_model)
     sd_cpu = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
     with open(h.quantized_model_path, 'rb') as f:
@@ -1682,9 +1831,10 @@ def train_model(h, device, val_data):
             return max((1.0 - frac) / h.warmdown_frac, h.min_lr)
         return 1.0
 
-    def step_fn(step, lr_scale, ds_alpha_effective=0.0):
-        # Set DS alpha buffer BEFORE forward (outside compiled graph)
+    def step_fn(step, lr_scale, ds_alpha_effective=0.0, mtp_alpha_effective=0.0):
+        # Set DS + MTP alpha buffers BEFORE forward (outside compiled graph)
         base_model._ds_alpha_buf.fill_(ds_alpha_effective)
+        base_model._mtp_alpha_buf.fill_(mtp_alpha_effective)
         # Switched DS: pick one random layer to supervise this step
         if h.ds_switched and base_model.ds_layer_list:
             base_model._ds_current_layer = random.choice(base_model.ds_layer_list)
@@ -1780,8 +1930,9 @@ def train_model(h, device, val_data):
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1e3 * (time.perf_counter() - t0)
-            # Zero DS alpha so validation loss is pure CE (comparable to baseline)
+            # Zero DS + MTP alphas so validation loss is pure CE (comparable to baseline)
             base_model._ds_alpha_buf.fill_(0.0)
+            base_model._mtp_alpha_buf.fill_(0.0)
             val_loss, val_bpb = eval_val(h, device, val_data, model)
             log(f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}")
             torch.cuda.synchronize()
@@ -1826,7 +1977,26 @@ def train_model(h, device, val_data):
         else:
             ds_alpha_effective = 0.0
 
-        train_loss = step_fn(step, scale, ds_alpha_effective=ds_alpha_effective)
+        # ---- Compute effective MTP alpha (shares DS schedule pattern) ----
+        if h.mtp_enabled:
+            mtp_warmup_factor = min(step / max(h.mtp_warmup_steps, 1), 1.0)
+            # Same fraction-based decay as DS — keeps EMA window clean
+            if frac < h.ds_decay_start_frac:
+                mtp_frac_factor = 1.0
+            elif frac < h.ds_decay_end_frac:
+                span = max(h.ds_decay_end_frac - h.ds_decay_start_frac, 1e-9)
+                mtp_frac_factor = 1.0 - (frac - h.ds_decay_start_frac) / span
+            else:
+                mtp_frac_factor = 0.0
+            mtp_warmdown_factor = scale
+            mtp_alpha_effective = (h.mtp_alpha * mtp_warmup_factor
+                                   * mtp_frac_factor * mtp_warmdown_factor)
+        else:
+            mtp_alpha_effective = 0.0
+
+        train_loss = step_fn(step, scale,
+                             ds_alpha_effective=ds_alpha_effective,
+                             mtp_alpha_effective=mtp_alpha_effective)
 
         # EMA update
         with torch.no_grad():
@@ -1890,6 +2060,7 @@ def train_and_eval(h, device):
     torch._dynamo.reset()
 
     base_model._ds_alpha_buf.fill_(0.0)  # pure CE for eval
+    base_model._mtp_alpha_buf.fill_(0.0)
     timed_eval('pre-quantization post-ema', eval_val, h, device, val_data, compiled_model)
     serialize(h, base_model, Path(__file__).read_text(encoding='utf-8'))
 
