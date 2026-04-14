@@ -165,6 +165,12 @@ class Hyperparameters:
     embed_bits      = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas  = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
+    # Per-layer adaptive GPTQ clipping: MLP and attention get different sigmas.
+    # MLP tighter (more precision where weights are well-conditioned).
+    # Attn looser (preserve outliers in K/Q/V which have larger variance).
+    # Defaults match MATRIX_CLIP_SIGMAS for backward compat (single-sigma mode).
+    mlp_clip_sigmas  = float(os.environ.get('MLP_CLIP_SIGMAS', matrix_clip_sigmas))
+    attn_clip_sigmas = float(os.environ.get('ATTN_CLIP_SIGMAS', matrix_clip_sigmas))
 
     # ---- Deep Supervision (novel addition) ----
     # Intermediate CE loss at selected layers through the shared LM head.
@@ -1197,7 +1203,14 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
 
 
 def gptq_mixed_quantize(state_dict, hessians, h):
-    """Quantize all large matrices via GPTQ, passthrough small/scalar tensors."""
+    """Quantize all large matrices via GPTQ with per-layer adaptive clipping.
+
+    Per-layer sigmas (PR #1586 approach):
+      - Embeddings: h.embed_clip_sigmas at int h.embed_bits (default int8, σ=20)
+      - MLP weights: h.mlp_clip_sigmas at int h.matrix_bits (default int6, σ=12.85)
+      - Attention weights: h.attn_clip_sigmas at int h.matrix_bits
+      - Other large matrices: h.matrix_clip_sigmas (backward-compat fallback)
+    """
     result = {}
     meta = {}
     for name, tensor in state_dict.items():
@@ -1206,13 +1219,24 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = 'passthrough (float16)'
             continue
-        cs = h.embed_clip_sigmas if 'tok_emb' in name else h.matrix_clip_sigmas
-        bits = h.embed_bits if 'tok_emb' in name else h.matrix_bits
+        # Per-layer adaptive sigma + bit-width dispatch
+        if 'tok_emb' in name:
+            cs = h.embed_clip_sigmas
+            bits = h.embed_bits
+        elif '.mlp.' in name:
+            cs = h.mlp_clip_sigmas
+            bits = h.matrix_bits
+        elif '.attn.' in name:
+            cs = h.attn_clip_sigmas
+            bits = h.matrix_bits
+        else:
+            cs = h.matrix_clip_sigmas
+            bits = h.matrix_bits
         q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs,
                                      clip_range=2 ** (bits - 1) - 1)
         result[name + '.q'] = q
         result[name + '.scale'] = s
-        meta[name] = f"gptq (int{bits})"
+        meta[name] = f"gptq (int{bits}, sigma={cs})"
 
     categories = collections.defaultdict(set)
     for name, cat in meta.items():
