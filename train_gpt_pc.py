@@ -193,6 +193,14 @@ class Hyperparameters:
     # computing all auxiliary losses. Reduces compute overhead ~3x, enabling
     # more training steps. Based on "switched auxiliary loss" literature.
     ds_switched           = bool(int(os.environ.get('DS_SWITCHED', '0')))
+    # Self-Distillation DS: mix CE-against-tokens with KL-against-final-logits.
+    # Lambda=0 (default) -> pure CE (identical to original DS behavior).
+    # Lambda>0          -> use detached final-layer logits as a soft "teacher"
+    # distribution for the intermediate layer. Aligned with the main loss, so
+    # no aux/main gradient conflict (the aux target IS the main target, softened).
+    # Temperature softens both distributions before KL (standard KD, Hinton 2015).
+    ds_kl_lambda          = float(os.environ.get('DS_KL_LAMBDA', 0.0))
+    ds_kl_temperature     = float(os.environ.get('DS_KL_TEMPERATURE', 2.0))
 
     # Distributed
     distributed     = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
@@ -600,6 +608,10 @@ def _compute_ds_loss(x, final_norm, tok_emb_weight, head_proj, lm_head,
                      tie_embeddings, logit_softcap, targets, layer_frac):
     """Compute auxiliary CE loss at an intermediate layer.
 
+    Returns (ce_loss_scaled, intermediate_logits).  The logits are returned
+    so callers can optionally compute an additional self-distillation KL
+    term against the detached final-layer logits (see GPT.forward).
+
     Uses the shared LM head (or tied embeddings) to predict next token
     from the intermediate hidden state.  Weighted by layer_frac so that
     deeper layers contribute more to the auxiliary signal.
@@ -619,7 +631,7 @@ def _compute_ds_loss(x, final_norm, tok_emb_weight, head_proj, lm_head,
         targets.reshape(-1),
         reduction='mean',
     )
-    return loss * layer_frac
+    return loss * layer_frac, logits
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +728,8 @@ class GPT(nn.Module):
         # Zero artifact cost.  Alpha buffer avoids dynamo recompilation.
         self.ds_enabled = h.ds_enabled
         self.ds_switched = h.ds_switched
+        self.ds_kl_lambda = h.ds_kl_lambda
+        self.ds_kl_temperature = h.ds_kl_temperature
         self.register_buffer('_ds_alpha_buf', torch.zeros(()), persistent=False)
         self.ds_layer_set = set(
             int(x) for x in h.ds_layers.split(',') if x.strip()
@@ -814,6 +828,14 @@ class GPT(nn.Module):
         # ---- Forward through blocks with optional Deep Supervision ----
         ds_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         ds_count = 0
+        # Single-slot cache for Self-Distillation KL (switched DS only).
+        # Holds the most recent intermediate logits tapped during the layer
+        # loops. Under torch.compile(fullgraph=True) + switched DS,
+        # `_ds_current_layer` is a constant-per-compilation, so exactly one
+        # physical layer writes here and the `is not None` branch resolves at
+        # trace time.  When DS_KL_LAMBDA=0 (default), these are never read.
+        ds_cached_logits = None
+        ds_cached_frac = 0.0
         skips = []
 
         enc_iter = (self.encoder_indices if self.looping_active
@@ -843,13 +865,16 @@ class GPT(nn.Module):
             skips.append(x)
             if _ds_active_at(i):
                 layer_frac = (virtual_idx + 1) / total_virtual
-                ds_loss = ds_loss + _compute_ds_loss(
+                ce_scaled, interm_logits = _compute_ds_loss(
                     x, self.final_norm, self.tok_emb.weight,
                     self.head_proj, self.lm_head,
                     self.tie_embeddings, self.logit_softcap,
                     target_ids, layer_frac,
                 )
+                ds_loss = ds_loss + ce_scaled
                 ds_count += 1
+                ds_cached_logits = interm_logits
+                ds_cached_frac = layer_frac
             virtual_idx += 1
 
         # Decoder pass with skip connections
@@ -869,13 +894,16 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0)
             if _ds_active_at(i):
                 layer_frac = (virtual_idx + 1) / total_virtual
-                ds_loss = ds_loss + _compute_ds_loss(
+                ce_scaled, interm_logits = _compute_ds_loss(
                     x, self.final_norm, self.tok_emb.weight,
                     self.head_proj, self.lm_head,
                     self.tie_embeddings, self.logit_softcap,
                     target_ids, layer_frac,
                 )
+                ds_loss = ds_loss + ce_scaled
                 ds_count += 1
+                ds_cached_logits = interm_logits
+                ds_cached_frac = layer_frac
             virtual_idx += 1
 
         # Main CE loss from final layer
@@ -888,7 +916,27 @@ class GPT(nn.Module):
 
         # Add weighted Deep Supervision loss
         if self.ds_enabled and ds_count > 0:
-            return ce_loss + self._ds_alpha_buf * (ds_loss / ds_count)
+            ds_aux = ds_loss / ds_count
+
+            # Self-Distillation: blend in KL against detached final logits.
+            # ds_kl_lambda=0 -> pure CE (original behavior, no extra work).
+            # Uses the single-slot cache populated during the layer loops;
+            # `is not None` resolves at trace time under torch.compile.
+            if self.ds_kl_lambda > 0.0 and ds_cached_logits is not None:
+                T = self.ds_kl_temperature
+                teacher_probs = F.softmax(logits.detach().float() / T, dim=-1)
+                student_log_probs = F.log_softmax(
+                    ds_cached_logits.float() / T, dim=-1)
+                V = student_log_probs.size(-1)
+                kl_loss = F.kl_div(
+                    student_log_probs.reshape(-1, V),
+                    teacher_probs.reshape(-1, V),
+                    reduction='batchmean',
+                ) * (T * T) * ds_cached_frac
+                ds_aux = ((1.0 - self.ds_kl_lambda) * ds_aux
+                          + self.ds_kl_lambda * kl_loss)
+
+            return ce_loss + self._ds_alpha_buf * ds_aux
 
         return ce_loss
 
